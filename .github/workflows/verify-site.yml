@@ -1,0 +1,86 @@
+name: verify-site
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+jobs:
+  chrome:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      SITE_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: GitHub Pages status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          api="https://api.github.com/repos/${{ github.repository }}/pages"
+          status=$(curl -sS -o pages.json -w "%{http_code}" -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api")
+          if [ "$status" = "404" ]; then
+            echo "PAGES | not enabled yet, trying to enable from main /"
+            curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" "$api" \
+              -d '{"build_type":"legacy","source":{"branch":"main","path":"/"}}' | head -c 400; echo
+          else
+            echo "PAGES | $(python3 -c 'import json; d=json.load(open("pages.json")); print(d.get("status"), d.get("html_url"), d.get("source"))')"
+          fi
+      - name: Wait until the published page matches this commit
+        run: |
+          for attempt in $(seq 1 60); do
+            if curl -fsS "$SITE_URL" -o live.html && cmp -s live.html index.html; then
+              echo "SITE | live and identical to index.html | $SITE_URL"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "SITE | not live: $(curl -sS -o /dev/null -w '%{http_code}' "$SITE_URL") | $SITE_URL"
+          exit 1
+      - name: Generate Portuguese speech clips
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg espeak-ng > /dev/null
+          pip install -q gTTS
+          mkdir -p "$RUNNER_TEMP/audio" && cd "$RUNNER_TEMP/audio"
+          python3 - <<'PY'
+          import subprocess
+          clips = {
+              "her": "Agora, você precisa desenvolver mais a parte de análise de dados e indicadores.",
+              "me": "Você consegue me dar um exemplo concreto disso?",
+          }
+          for name, text in clips.items():
+              try:
+                  from gtts import gTTS
+                  gTTS(text, lang="pt", tld="com.br").save(f"{name}.mp3")
+              except Exception as error:
+                  print(name, "espeak fallback:", error)
+                  subprocess.run(["espeak-ng", "-v", "pt-br", "-s", "150", "-w", f"{name}.mp3", text], check=True)
+          PY
+          for clip in her me; do
+            ffmpeg -loglevel error -y -f lavfi -t 1.5 -i anullsrc=r=48000:cl=mono -i "$clip.mp3" -f lavfi -t 2.5 -i anullsrc=r=48000:cl=mono \
+              -filter_complex "[1:a]aresample=48000,aformat=channel_layouts=mono[s];[0:a][s][2:a]concat=n=3:v=0:a=1" \
+              -ar 48000 -ac 1 -sample_fmt s16 "$clip.wav"
+          done
+          ffmpeg -loglevel error -y -f lavfi -t 5 -i anullsrc=r=48000:cl=mono -ar 48000 -ac 1 -sample_fmt s16 silence.wav
+      - name: Install Playwright client
+        run: npm install --no-save --no-package-lock --no-audit --no-fund playwright@1.56.1
+      - name: Virtual microphone (PulseAudio)
+        run: |
+          sudo apt-get install -y -qq pulseaudio pulseaudio-utils > /dev/null
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=virtmic sink_properties=device.description=VirtualSpeaker
+          # Chrome hides ".monitor" sources, so expose the sink as a regular microphone.
+          pactl load-module module-remap-source master=virtmic.monitor source_name=virtmic_src source_properties=device.description=VirtualMic
+          pactl set-default-sink virtmic
+          pactl set-default-source virtmic_src
+          echo "$RUNNER_TEMP/audio/silence.wav" > "$RUNNER_TEMP/mic-clip"
+          nohup bash -c 'while true; do paplay --device=virtmic "$(cat "$0")"; done' "$RUNNER_TEMP/mic-clip" > /dev/null 2>&1 &
+          sleep 2
+      - name: Google Chrome on the published link
+        env:
+          MIC_CONTROL: ${{ runner.temp }}/mic-clip
+        run: xvfb-run -a node e2e/listen.mjs "$SITE_URL" "$RUNNER_TEMP/audio"
